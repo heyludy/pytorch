@@ -91,6 +91,8 @@ from .ir import (
     View,
 )
 from .ops_handler import register_pointwise_op
+from .runtime.hints import get_warp_size
+from .runtime.runtime_utils import next_power_of_2
 from .utils import (
     ceildiv,
     convert_symint_to_expr,
@@ -9965,12 +9967,69 @@ register_comm_lowerings()
 register_symm_mem_lowerings()
 
 
+def _strict_softmax_row_len(x, dim) -> int | None:
+    """Static row length if eager computes this softmax with softmax_warp_forward."""
+    size = x.get_size()
+    dtype = x.get_dtype()
+    if (
+        not config.strict_reduction
+        or not size
+        or x.get_device().type != "cuda"
+        or dim % len(size) != len(size) - 1
+        or dtype not in (torch.float32, torch.float64)
+        or not isinstance(size[-1], (int, sympy.Integer))
+    ):
+        return None
+    row = int(size[-1])
+    # Eager's dispatch: rows <= 2048 elements and <= 8192 bytes.
+    return row if 0 < row <= (2048 if dtype == torch.float32 else 1024) else None
+
+
+def _strict_softmax_sum(exp, row):
+    """
+    Softmax denominator in the order of eager's softmax_warp_forward: each lane adds
+    its warp-strided elements in sequence, then the lanes combine with an xor-shuffle
+    tree (equivalent to halving). The order is fixed in the IR, so it does not depend
+    on the Triton layout or launch config.
+    """
+    size = exp.get_size()
+    lanes = min(next_power_of_2(row), get_warp_size(exp.get_device()))
+    loader = exp.make_loader()
+
+    def inner_fn(idx):
+        partials = []
+        for lane in range(lanes):
+            acc = None
+            for i in range(lane, row, lanes):
+                val = loader([*idx[:-1], sympy.Integer(i)])
+                acc = val if acc is None else ops.add(acc, val)
+            partials.append(acc)
+        while len(partials) > 1:
+            half = len(partials) // 2
+            partials = [
+                lo if hi is None else ops.add(lo, hi)
+                for lo, hi in zip(partials[:half], partials[half:])
+            ]
+        return partials[0]
+
+    return Pointwise.create(
+        device=exp.get_device(),
+        dtype=exp.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[*size[:-1], 1],
+    )
+
+
 @register_lowering(inductor_prims.prepare_softmax_online, type_promotion_kind=None)
 def prepare_softmax_online(x, dim):
     """
     Lowering inductor_prims.prepare_softmax_online to compute max/sum with
     online softmax reductions when profitable.
     """
+    if (row := _strict_softmax_row_len(x, dim)) is not None:
+        amax = reduce_amax(x, dim, keepdims=True)
+        return amax, _strict_softmax_sum(lowerings[aten.exp](sub(x, amax)), row)
+
     kwargs = _make_reduction_inner(
         x, axis=dim, keepdims=True, dtype=None, override_return_dtype=None
     )
